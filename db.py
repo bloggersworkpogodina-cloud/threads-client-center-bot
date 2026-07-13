@@ -1,0 +1,225 @@
+import os
+import aiosqlite
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                telegram_id INTEGER UNIQUE,
+                invite_code TEXT UNIQUE NOT NULL,
+                threads_username TEXT,
+                telegram_link TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS threads_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                post_date TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                body TEXT NOT NULL,
+                sent_at TEXT,
+                published INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(client_id, post_date, slot),
+                FOREIGN KEY(client_id) REFERENCES clients(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                analytics_date TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                views INTEGER,
+                likes INTEGER,
+                comments INTEGER,
+                reposts INTEGER,
+                followers_delta INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(client_id, analytics_date, slot),
+                FOREIGN KEY(client_id) REFERENCES clients(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS result_polls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                period_end TEXT NOT NULL,
+                tg_transitions INTEGER,
+                inquiries INTEGER,
+                sales INTEGER,
+                revenue REAL,
+                answer TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(client_id, period_end),
+                FOREIGN KEY(client_id) REFERENCES clients(id)
+            );
+            """
+        )
+        await db.commit()
+
+
+async def add_client(name, invite_code, threads_username=None, telegram_link=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO clients(name, invite_code, threads_username, telegram_link)
+            VALUES (?, ?, ?, ?)
+            """,
+            (name, invite_code, threads_username, telegram_link),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def bind_client(invite_code, telegram_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE clients
+            SET telegram_id = ?
+            WHERE invite_code = ? AND telegram_id IS NULL
+            """,
+            (telegram_id, invite_code),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_client_by_tg(telegram_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM clients WHERE telegram_id = ? AND is_active = 1",
+            (telegram_id,),
+        )
+        return await cur.fetchone()
+
+
+async def get_client(client_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
+        return await cur.fetchone()
+
+
+async def list_clients(active_only=True):
+    sql = "SELECT * FROM clients"
+    if active_only:
+        sql += " WHERE is_active = 1"
+    sql += " ORDER BY name"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(sql)
+        return await cur.fetchall()
+
+
+async def save_post(client_id, post_date, slot, body):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO threads_posts(client_id, post_date, slot, body)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(client_id, post_date, slot)
+            DO UPDATE SET body = excluded.body, sent_at = NULL
+            """,
+            (client_id, post_date, slot, body),
+        )
+        await db.commit()
+
+
+async def get_posts(client_id, post_date):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT * FROM threads_posts
+            WHERE client_id = ? AND post_date = ?
+            ORDER BY slot
+            """,
+            (client_id, post_date),
+        )
+        return await cur.fetchall()
+
+
+async def mark_posts_sent(client_id, post_date):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE threads_posts
+            SET sent_at = CURRENT_TIMESTAMP
+            WHERE client_id = ? AND post_date = ?
+            """,
+            (client_id, post_date),
+        )
+        await db.commit()
+
+
+async def mark_published(post_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE threads_posts SET published = 1 WHERE id = ?",
+            (post_id,),
+        )
+        await db.commit()
+
+
+async def save_analytics(client_id, analytics_date, slot, views, likes, comments, reposts, followers_delta):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO analytics(
+                client_id, analytics_date, slot, views, likes, comments, reposts, followers_delta
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_id, analytics_date, slot)
+            DO UPDATE SET
+                views = excluded.views,
+                likes = excluded.likes,
+                comments = excluded.comments,
+                reposts = excluded.reposts,
+                followers_delta = excluded.followers_delta
+            """,
+            (client_id, analytics_date, slot, views, likes, comments, reposts, followers_delta),
+        )
+        await db.commit()
+
+
+async def get_day_analytics(client_id, analytics_date):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT * FROM analytics
+            WHERE client_id = ? AND analytics_date = ?
+            ORDER BY slot
+            """,
+            (client_id, analytics_date),
+        )
+        return await cur.fetchall()
+
+
+async def save_result_poll(client_id, period_end, tg_transitions=None, inquiries=None, sales=None, revenue=None, answer=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO result_polls(
+                client_id, period_end, tg_transitions, inquiries, sales, revenue, answer
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_id, period_end)
+            DO UPDATE SET
+                tg_transitions = excluded.tg_transitions,
+                inquiries = excluded.inquiries,
+                sales = excluded.sales,
+                revenue = excluded.revenue,
+                answer = excluded.answer
+            """,
+            (client_id, period_end, tg_transitions, inquiries, sales, revenue, answer),
+        )
+        await db.commit()
