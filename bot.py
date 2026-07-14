@@ -44,6 +44,7 @@ def admin_menu():
         keyboard=[
             [KeyboardButton(text="📊 Внести аналитику"), KeyboardButton(text="📝 Ветки")],
             [KeyboardButton(text="👥 Клиенты"), KeyboardButton(text="📈 Отчёты")],
+            [KeyboardButton(text="💬 Создать темы")],
         ],
         resize_keyboard=True,
     )
@@ -251,26 +252,6 @@ async def clients(message: Message):
     )
 
 
-@router.callback_query(F.data.startswith("client_open:"))
-async def open_client_card_fixed(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
-        return
-    client_id = int(callback.data.split(":")[1])
-    client = await db.get_client(client_id)
-    if not client:
-        await callback.answer("Клиент не найден", show_alert=True)
-        return
-    text = (
-        f"<b>{client['name']}</b>\n"
-        f"Threads: @{client['threads_username'] or '—'}\n"
-        f"Telegram: {client['telegram_link'] or '—'}\n"
-        f"Статус: {'подключён' if client['telegram_user_id'] else 'не подключён'}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💬 Создать тему", callback_data=f"client_topic:{client_id}")
-    ]])
-    await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
 
 @router.callback_query(F.data.startswith("client_card:"))
 async def client_card(callback: CallbackQuery):
@@ -975,6 +956,7 @@ async def main():
         BotCommand(command="start", description="Запустить"),
         BotCommand(command="menu", description="Открыть меню"),
         BotCommand(command="chatid", description="Показать ID группы"),
+        BotCommand(command="topics", description="Создать темы клиентам"),
     ])
 
     await dp.start_polling(bot)
