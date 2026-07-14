@@ -71,6 +71,11 @@ async def init_db():
             );
             """
         )
+        # Миграция существующей базы: добавляем ссылку на контент-план без удаления данных.
+        cur = await db.execute("PRAGMA table_info(clients)")
+        columns = {row[1] for row in await cur.fetchall()}
+        if "content_plan_url" not in columns:
+            await db.execute("ALTER TABLE clients ADD COLUMN content_plan_url TEXT")
         await db.commit()
 
 
@@ -262,5 +267,23 @@ async def save_message_link(client_id, client_message_id=None, group_message_id=
             VALUES (?, ?, ?)
             """,
             (client_id, client_message_id, group_message_id),
+        )
+        await db.commit()
+
+
+async def close_client(client_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE clients SET is_active = 0 WHERE id = ?",
+            (client_id,),
+        )
+        await db.commit()
+
+
+async def set_content_plan_url(client_id, url):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE clients SET content_plan_url = ? WHERE id = ?",
+            (url, client_id),
         )
         await db.commit()
