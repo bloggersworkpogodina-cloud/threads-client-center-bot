@@ -52,8 +52,13 @@ def admin_menu():
 
 def client_menu():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📅 Ветки на сегодня")]],
+        keyboard=[
+            [KeyboardButton(text="📅 Ветки на сегодня")],
+            [KeyboardButton(text="📄 Контент-план")],
+            [KeyboardButton(text="💬 Связь с менеджером")],
+        ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -115,6 +120,14 @@ class AddClient(StatesGroup):
     name = State()
     threads = State()
     tg_link = State()
+
+
+class ContentPlanFlow(StatesGroup):
+    waiting_url = State()
+
+
+class ManagerFlow(StatesGroup):
+    waiting_message = State()
 
 
 class AddPosts(StatesGroup):
@@ -270,11 +283,71 @@ async def client_card(callback: CallbackQuery):
         f"Статус: {status}"
     )
     topic_text = "💬 Тема уже создана" if c["topic_id"] else "💬 Создать тему"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=topic_text, callback_data=f"client_topic:{client_id}")
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=topic_text, callback_data=f"client_topic:{client_id}")],
+        [InlineKeyboardButton(text="📄 Установить контент-план", callback_data=f"content_plan:{client_id}")],
+        [InlineKeyboardButton(text="🔴 Закрыть проект", callback_data=f"close_project:{client_id}")],
+    ])
     await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
+
+
+
+@router.callback_query(F.data.startswith("content_plan:"))
+async def content_plan_start(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    client_id = int(callback.data.split(":")[1])
+    await state.update_data(content_plan_client_id=client_id)
+    await state.set_state(ContentPlanFlow.waiting_url)
+    await callback.message.answer("Пришлите ссылку на Google Docs с контент-планом:")
+    await callback.answer()
+
+
+@router.message(ContentPlanFlow.waiting_url)
+async def content_plan_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    url = (message.text or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await message.answer("Пришлите корректную ссылку, начинающуюся с http:// или https://")
+        return
+    data = await state.get_data()
+    await db.set_content_plan_url(data["content_plan_client_id"], url)
+    await state.clear()
+    await message.answer("Контент-план сохранён ✅", reply_markup=admin_menu())
+
+
+@router.callback_query(F.data.startswith("close_project:"))
+async def close_project_ask(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    client_id = int(callback.data.split(":")[1])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Да, закрыть", callback_data=f"close_confirm:{client_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data="close_cancel"),
+    ]])
+    await callback.message.answer(
+        "Закрыть проект? Клиент исчезнет из активных, но вся история сохранится.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("close_confirm:"))
+async def close_project_confirm(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    client_id = int(callback.data.split(":")[1])
+    await db.close_client(client_id)
+    await callback.message.answer("Проект закрыт ✅")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "close_cancel")
+async def close_project_cancel(callback: CallbackQuery):
+    await callback.answer("Отменено")
+    await callback.message.answer("Закрытие проекта отменено.")
 
 
 @router.callback_query(F.data == "client_add")
@@ -548,6 +621,61 @@ async def client_today_posts(message: Message, bot: Bot):
     ok, text = await send_posts_to_client(bot, client["id"], date.today().isoformat())
     if not ok:
         await message.answer(text)
+
+
+@router.message(F.text == "📄 Контент-план")
+async def client_content_plan(message: Message):
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client:
+        return
+    url = client["content_plan_url"]
+    if not url:
+        await message.answer("Контент-план пока не добавлен.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Открыть контент-план", url=url)
+    ]])
+    await message.answer("Ваш контент-план:", reply_markup=kb)
+
+
+@router.message(F.text == "💬 Связь с менеджером")
+async def manager_contact_start(message: Message, state: FSMContext):
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client:
+        return
+    await state.set_state(ManagerFlow.waiting_message)
+    await message.answer(
+        "Напишите ваш вопрос или сообщение 👇\n"
+        "Менеджер ответит вам в ближайшее время."
+    )
+
+
+@router.message(ManagerFlow.waiting_message)
+async def manager_contact_message(message: Message, state: FSMContext, bot: Bot):
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client:
+        await state.clear()
+        return
+
+    topic_id = await ensure_client_topic(bot, client["id"])
+    if not topic_id:
+        await message.answer("Не удалось связаться с менеджером. Попробуйте позже.")
+        await state.clear()
+        return
+
+    await bot.send_message(
+        WORK_GROUP_ID,
+        "<b>Сообщение от клиента</b>",
+        message_thread_id=topic_id,
+    )
+    await bot.copy_message(
+        chat_id=WORK_GROUP_ID,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+        message_thread_id=topic_id,
+    )
+    await state.clear()
+    await message.answer("Сообщение отправлено менеджеру ✅", reply_markup=client_menu())
 
 
 @router.message(F.text == "📊 Внести аналитику")
@@ -860,7 +988,13 @@ async def result_revenue(message: Message, state: FSMContext):
 
 @router.message(
     F.chat.type == "private",
-    ~F.text.in_({"/start", "/menu"}),
+    ~F.text.in_({
+        "/start",
+        "/menu",
+        "📅 Ветки на сегодня",
+        "📄 Контент-план",
+        "💬 Связь с менеджером",
+    }),
 )
 async def client_message_to_topic(message: Message, bot: Bot, state: FSMContext):
     # Не перехватываем сообщения во время активного сценария FSM.
@@ -952,12 +1086,7 @@ async def main():
     )
     scheduler.start()
 
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить"),
-        BotCommand(command="menu", description="Открыть меню"),
-        BotCommand(command="chatid", description="Показать ID группы"),
-        BotCommand(command="topics", description="Создать темы клиентам"),
-    ])
+    await bot.delete_my_commands()
 
     await dp.start_polling(bot)
 
