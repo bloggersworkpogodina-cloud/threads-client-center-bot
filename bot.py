@@ -52,7 +52,11 @@ def admin_menu():
 
 def client_menu():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📅 Ветки на сегодня")]],
+        keyboard=[
+            [KeyboardButton(text="📅 Ветки на сегодня")],
+            [KeyboardButton(text="📄 Контент-план")],
+            [KeyboardButton(text="💬 Связь с менеджером")],
+        ],
         resize_keyboard=True,
     )
 
@@ -121,6 +125,10 @@ class AddPosts(StatesGroup):
     client = State()
     post_date = State()
     payload = State()
+
+
+class ManagerFlow(StatesGroup):
+    waiting_message = State()
 
 
 class AnalyticsFlow(StatesGroup):
@@ -550,6 +558,62 @@ async def client_today_posts(message: Message, bot: Bot):
         await message.answer(text)
 
 
+@router.message(F.text == "📄 Контент-план")
+async def client_content_plan(message: Message):
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client:
+        await message.answer("Личный кабинет не найден.")
+        return
+    url = client["content_plan_url"]
+    if not url:
+        await message.answer("Контент-план пока не добавлен.", reply_markup=client_menu())
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Открыть контент-план", url=url)
+    ]])
+    await message.answer("Ваш контент-план:", reply_markup=kb)
+
+
+@router.message(F.text == "💬 Связь с менеджером")
+async def manager_contact_start(message: Message, state: FSMContext):
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client:
+        await message.answer("Личный кабинет не найден.")
+        return
+    await state.set_state(ManagerFlow.waiting_message)
+    await message.answer("Напишите ваш вопрос или сообщение 👇\nМенеджер ответит вам в ближайшее время.")
+
+
+@router.message(ManagerFlow.waiting_message)
+async def manager_contact_message(message: Message, state: FSMContext, bot: Bot):
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client:
+        await state.clear()
+        await message.answer("Личный кабинет не найден.")
+        return
+    try:
+        topic_id = await ensure_client_topic(bot, client["id"])
+        if not topic_id:
+            raise RuntimeError("Не удалось определить тему клиента")
+        await bot.send_message(
+            WORK_GROUP_ID,
+            "<b>Сообщение от клиента</b>",
+            message_thread_id=topic_id,
+        )
+        await bot.copy_message(
+            chat_id=WORK_GROUP_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            message_thread_id=topic_id,
+        )
+        await state.clear()
+        await message.answer("Сообщение отправлено менеджеру ✅", reply_markup=client_menu())
+    except Exception:
+        logging.exception("Не удалось передать сообщение менеджеру")
+        await state.clear()
+        await message.answer("Не удалось отправить сообщение. Попробуйте позже.", reply_markup=client_menu())
+
+
 @router.message(F.text == "📊 Внести аналитику")
 async def analytics_start(message: Message):
     if not await is_admin(message.from_user.id):
@@ -860,7 +924,13 @@ async def result_revenue(message: Message, state: FSMContext):
 
 @router.message(
     F.chat.type == "private",
-    ~F.text.in_({"/start", "/menu"}),
+    ~F.text.in_({
+        "/start",
+        "/menu",
+        "📅 Ветки на сегодня",
+        "📄 Контент-план",
+        "💬 Связь с менеджером",
+    }),
 )
 async def client_message_to_topic(message: Message, bot: Bot, state: FSMContext):
     # Не перехватываем сообщения во время активного сценария FSM.
@@ -952,12 +1022,7 @@ async def main():
     )
     scheduler.start()
 
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить"),
-        BotCommand(command="menu", description="Открыть меню"),
-        BotCommand(command="chatid", description="Показать ID группы"),
-        BotCommand(command="topics", description="Создать темы клиентам"),
-    ])
+    await bot.delete_my_commands()
 
     await dp.start_polling(bot)
 

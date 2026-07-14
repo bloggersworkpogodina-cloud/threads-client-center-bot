@@ -163,14 +163,44 @@ async def add_client(name, invite_code, threads_username=None, telegram_link=Non
 
 
 async def bind_client(invite_code, telegram_id):
+    """
+    Безопасно привязывает Telegram-пользователя к клиенту по invite_code.
+    Если telegram_id уже привязан к старой записи, переносит его.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+
+        cur = await db.execute(
+            """
+            SELECT id
+            FROM clients
+            WHERE invite_code = ? AND is_active = 1
+            """,
+            (invite_code,),
+        )
+        target = await cur.fetchone()
+        if not target:
+            await db.rollback()
+            return False
+
+        target_id = target[0]
+
+        await db.execute(
+            """
+            UPDATE clients
+            SET telegram_id = NULL
+            WHERE telegram_id = ? AND id != ?
+            """,
+            (telegram_id, target_id),
+        )
+
         cur = await db.execute(
             """
             UPDATE clients
             SET telegram_id = ?
-            WHERE invite_code = ? AND telegram_id IS NULL
+            WHERE id = ? AND is_active = 1
             """,
-            (telegram_id, invite_code),
+            (telegram_id, target_id),
         )
         await db.commit()
         return cur.rowcount > 0
