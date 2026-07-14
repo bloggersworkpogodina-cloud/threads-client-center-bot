@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -117,12 +118,15 @@ async def start(message: Message, state: FSMContext):
 
     client = await db.get_client_by_tg(message.from_user.id)
     if client:
-        await message.answer("<b>Добро пожаловать в личный кабинет 👋</b>\n\n"
+        await message.answer(
+            "<b>Добро пожаловать в личный кабинет 👋</b>\n\n"
             "Здесь проходит наша работа с контентом в Threads.\n\n"
             "Каждый день вы будете получать готовые ветки для публикации.\n\n"
             "Раз в 2 дня бот попросит вас коротко отметить результаты продвижения: переходы в Telegram, обращения и продажи.\n\n"
             "Это поможет нам отслеживать не только охваты, но и реальный результат работы.\n\n"
-            "<b>Личный кабинет подключён ✅</b>", reply_markup=client_menu())
+            "<b>Личный кабинет подключён ✅</b>",
+            reply_markup=client_menu(),
+        )
         return
 
     if len(args) == 2 and args[1].startswith("invite_"):
@@ -132,11 +136,11 @@ async def start(message: Message, state: FSMContext):
             client = await db.get_client_by_tg(message.from_user.id)
             await message.answer(
                 "<b>Добро пожаловать в личный кабинет 👋</b>\n\n"
-            "Здесь проходит наша работа с контентом в Threads.\n\n"
-            "Каждый день вы будете получать готовые ветки для публикации.\n\n"
-            "Раз в 2 дня бот попросит вас коротко отметить результаты продвижения: переходы в Telegram, обращения и продажи.\n\n"
-            "Это поможет нам отслеживать не только охваты, но и реальный результат работы.\n\n"
-            "<b>Личный кабинет подключён ✅</b>",
+                "Здесь проходит наша работа с контентом в Threads.\n\n"
+                "Каждый день вы будете получать готовые ветки для публикации.\n\n"
+                "Раз в 2 дня бот попросит вас коротко отметить результаты продвижения: переходы в Telegram, обращения и продажи.\n\n"
+                "Это поможет нам отслеживать не только охваты, но и реальный результат работы.\n\n"
+                "<b>Личный кабинет подключён ✅</b>",
                 reply_markup=client_menu(),
             )
             return
@@ -672,7 +676,10 @@ async def result_revenue(message: Message, state: FSMContext):
 
 async def main():
     await db.init_db()
-    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(
+        BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
