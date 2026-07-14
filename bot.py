@@ -144,6 +144,33 @@ async def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
+
+@router.message(Command("topics"))
+async def create_missing_topics_command(message: Message, bot: Bot):
+    if not await is_admin(message.from_user.id):
+        return
+    if not WORK_GROUP_ID:
+        await message.answer("Не указан WORK_GROUP_ID.")
+        return
+    clients = await db.list_clients()
+    created, already, failed = [], [], []
+    for row in clients:
+        try:
+            c = await db.get_client(row["id"])
+            if c["topic_id"]:
+                already.append(c["name"])
+                continue
+            topic_id = await ensure_client_topic(bot, c["id"])
+            (created if topic_id else failed).append(c["name"])
+        except Exception:
+            logging.exception("create topic failed")
+            failed.append(row["name"])
+    await message.answer(
+        "Созданы: " + (", ".join(created) or "—") + "\n"
+        "Уже были: " + (", ".join(already) or "—") + "\n"
+        "Ошибки: " + (", ".join(failed) or "—")
+    )
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     args = message.text.split(maxsplit=1)
