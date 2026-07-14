@@ -76,6 +76,80 @@ async def init_db():
         columns = {row[1] for row in await cur.fetchall()}
         if "content_plan_url" not in columns:
             await db.execute("ALTER TABLE clients ADD COLUMN content_plan_url TEXT")
+
+        # Чистим старые дубли без удаления истории.
+        cur = await db.execute(
+            """
+            SELECT LOWER(TRIM(threads_username)) AS key_name
+            FROM clients
+            WHERE threads_username IS NOT NULL
+              AND TRIM(threads_username) != ''
+              AND is_active = 1
+            GROUP BY LOWER(TRIM(threads_username))
+            HAVING COUNT(*) > 1
+            """
+        )
+        duplicate_keys = [row[0] for row in await cur.fetchall()]
+
+        for key_name in duplicate_keys:
+            cur = await db.execute(
+                """
+                SELECT id, telegram_id, topic_id, content_plan_url
+                FROM clients
+                WHERE LOWER(TRIM(threads_username)) = ?
+                  AND is_active = 1
+                ORDER BY
+                    CASE WHEN telegram_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+                    id DESC
+                """,
+                (key_name,),
+            )
+            rows = await cur.fetchall()
+            keeper = rows[0]
+            keeper_id = keeper[0]
+            keeper_telegram_id = keeper[1]
+            keeper_topic_id = keeper[2]
+            keeper_content_plan = keeper[3]
+
+            for row in rows[1:]:
+                duplicate_id, telegram_id, topic_id, content_plan_url = row
+
+                if keeper_telegram_id is None and telegram_id is not None:
+                    await db.execute(
+                        "UPDATE clients SET telegram_id = ? WHERE id = ?",
+                        (telegram_id, keeper_id),
+                    )
+                    keeper_telegram_id = telegram_id
+
+                if keeper_topic_id is None and topic_id is not None:
+                    await db.execute(
+                        "UPDATE clients SET topic_id = ? WHERE id = ?",
+                        (topic_id, keeper_id),
+                    )
+                    keeper_topic_id = topic_id
+
+                if not keeper_content_plan and content_plan_url:
+                    await db.execute(
+                        "UPDATE clients SET content_plan_url = ? WHERE id = ?",
+                        (content_plan_url, keeper_id),
+                    )
+                    keeper_content_plan = content_plan_url
+
+                await db.execute(
+                    "UPDATE clients SET is_active = 0 WHERE id = ?",
+                    (duplicate_id,),
+                )
+
+        await db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_clients_active_threads
+            ON clients(LOWER(TRIM(threads_username)))
+            WHERE is_active = 1
+              AND threads_username IS NOT NULL
+              AND TRIM(threads_username) != ''
+            """
+        )
+
         await db.commit()
 
 
@@ -86,7 +160,7 @@ async def add_client(name, invite_code, threads_username=None, telegram_link=Non
             INSERT INTO clients(name, invite_code, threads_username, telegram_link)
             VALUES (?, ?, ?, ?)
             """,
-            (name, invite_code, threads_username, telegram_link),
+            (name, invite_code, threads_username.strip().lstrip("@") if threads_username else None, telegram_link),
         )
         await db.commit()
         return cur.lastrowid
