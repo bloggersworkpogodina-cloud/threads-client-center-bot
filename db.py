@@ -15,6 +15,7 @@ async def init_db():
                 invite_code TEXT UNIQUE NOT NULL,
                 threads_username TEXT,
                 telegram_link TEXT,
+                topic_id INTEGER,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -43,6 +44,15 @@ async def init_db():
                 followers_delta INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(client_id, analytics_date, slot),
+                FOREIGN KEY(client_id) REFERENCES clients(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                client_message_id INTEGER,
+                group_message_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(client_id) REFERENCES clients(id)
             );
 
@@ -221,5 +231,36 @@ async def save_result_poll(client_id, period_end, tg_transitions=None, inquiries
                 answer = excluded.answer
             """,
             (client_id, period_end, tg_transitions, inquiries, sales, revenue, answer),
+        )
+        await db.commit()
+
+
+async def set_client_topic(client_id, topic_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE clients SET topic_id = ? WHERE id = ?",
+            (topic_id, client_id),
+        )
+        await db.commit()
+
+
+async def get_client_by_topic(topic_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM clients WHERE topic_id = ? AND is_active = 1",
+            (topic_id,),
+        )
+        return await cur.fetchone()
+
+
+async def save_message_link(client_id, client_message_id=None, group_message_id=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO message_links(client_id, client_message_id, group_message_id)
+            VALUES (?, ?, ?)
+            """,
+            (client_id, client_message_id, group_message_id),
         )
         await db.commit()

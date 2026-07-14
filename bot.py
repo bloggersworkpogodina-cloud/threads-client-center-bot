@@ -32,6 +32,7 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Berlin")
 DAILY_SEND_HOUR = int(os.getenv("DAILY_SEND_HOUR", "9"))
 RESULTS_POLL_HOUR = int(os.getenv("RESULTS_POLL_HOUR", "19"))
+WORK_GROUP_ID = int(os.getenv("WORK_GROUP_ID", "0"))
 TZ = ZoneInfo(TIMEZONE)
 
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +73,41 @@ def yes_no_keyboard(prefix):
             ]
         ]
     )
+
+
+
+async def ensure_client_topic(bot: Bot, client_id: int):
+    client = await db.get_client(client_id)
+    if not client or not WORK_GROUP_ID:
+        return None
+    if client["topic_id"]:
+        return client["topic_id"]
+
+    topic = await bot.create_forum_topic(
+        chat_id=WORK_GROUP_ID,
+        name=client["name"][:128],
+    )
+    await db.set_client_topic(client_id, topic.message_thread_id)
+    await bot.send_message(
+        WORK_GROUP_ID,
+        f"<b>Карточка клиента создана</b>\n"
+        f"Threads: @{client['threads_username'] or '—'}\n"
+        f"Telegram: {client['telegram_link'] or '—'}",
+        message_thread_id=topic.message_thread_id,
+    )
+    return topic.message_thread_id
+
+
+async def send_to_client_topic(bot: Bot, client_id: int, text: str):
+    if not WORK_GROUP_ID:
+        return
+    topic_id = await ensure_client_topic(bot, client_id)
+    if topic_id:
+        await bot.send_message(
+            WORK_GROUP_ID,
+            text,
+            message_thread_id=topic_id,
+        )
 
 
 class AddClient(StatesGroup):
@@ -148,6 +184,15 @@ async def start(message: Message, state: FSMContext):
     await message.answer("Эта ссылка недействительна или уже использована.")
 
 
+
+@router.message(Command("chatid"))
+async def chatid(message: Message):
+    if message.chat.type in {"group", "supergroup"}:
+        await message.answer(f"Chat ID: <code>{message.chat.id}</code>")
+    else:
+        await message.answer("Эту команду нужно отправить в рабочей группе.")
+
+
 @router.message(Command("menu"))
 async def menu(message: Message):
     if await is_admin(message.from_user.id):
@@ -205,6 +250,8 @@ async def client_tg_link(message: Message, state: FSMContext, bot: Bot):
     link = None if message.text.strip() == "-" else message.text.strip()
     code = secrets.token_urlsafe(8)
     client_id = await db.add_client(data["name"], code, data.get("threads"), link)
+    if WORK_GROUP_ID:
+        await ensure_client_topic(bot, client_id)
     me = await bot.get_me()
     invite = f"https://t.me/{me.username}?start=invite_{code}"
     await state.clear()
@@ -340,6 +387,12 @@ async def send_posts_to_client(bot: Bot, client_id: int, post_date: str):
             reply_markup=kb,
         )
     await db.mark_posts_sent(client_id, post_date)
+    await send_to_client_topic(
+        bot,
+        client_id,
+        f"📤 <b>Ветки на {human_date} отправлены клиенту</b>\n"
+        f"Количество: {len(posts)}",
+    )
     return True, "Ветки отправлены."
 
 
@@ -352,8 +405,16 @@ async def send_posts(callback: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("published:"))
-async def published(callback: CallbackQuery):
-    await db.mark_published(int(callback.data.split(":")[1]))
+async def published(callback: CallbackQuery, bot: Bot):
+    post_id = int(callback.data.split(":")[1])
+    await db.mark_published(post_id)
+    client = await db.get_client_by_tg(callback.from_user.id)
+    if client:
+        await send_to_client_topic(
+            bot,
+            client["id"],
+            "✅ Клиент отметил ветку как опубликованную.",
+        )
     await callback.answer("Отметила как опубликованную ✅")
 
 
@@ -674,6 +735,71 @@ async def result_revenue(message: Message, state: FSMContext):
     await message.answer("Спасибо, всё сохранила ✅")
 
 
+
+@router.message(
+    F.chat.type == "private",
+    ~F.text.in_({"/start", "/menu"}),
+)
+async def client_message_to_topic(message: Message, bot: Bot, state: FSMContext):
+    # Не перехватываем сообщения во время активного сценария FSM.
+    if await state.get_state():
+        return
+
+    client = await db.get_client_by_tg(message.from_user.id)
+    if not client or not WORK_GROUP_ID:
+        return
+
+    topic_id = await ensure_client_topic(bot, client["id"])
+    if not topic_id:
+        return
+
+    header = await bot.send_message(
+        WORK_GROUP_ID,
+        "<b>Сообщение от клиента</b>",
+        message_thread_id=topic_id,
+    )
+
+    copied = await bot.copy_message(
+        chat_id=WORK_GROUP_ID,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+        message_thread_id=topic_id,
+    )
+    await db.save_message_link(
+        client["id"],
+        client_message_id=message.message_id,
+        group_message_id=copied.message_id,
+    )
+    await message.answer("Сообщение передано ✅")
+
+
+@router.message(F.chat.id == WORK_GROUP_ID)
+async def topic_reply_to_client(message: Message, bot: Bot):
+    if not message.message_thread_id:
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    client = await db.get_client_by_topic(message.message_thread_id)
+    if not client or not client["telegram_id"]:
+        return
+
+    # Системные команды в группе клиенту не отправляем.
+    if message.text and message.text.startswith("/"):
+        return
+
+    try:
+        await bot.copy_message(
+            chat_id=client["telegram_id"],
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await message.reply("Отправлено клиенту ✅")
+    except Exception as exc:
+        logging.exception("Не удалось отправить сообщение клиенту: %s", exc)
+        await message.reply("Не удалось отправить сообщение клиенту.")
+
+
 async def main():
     await db.init_db()
     bot = Bot(
@@ -707,6 +833,7 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Запустить"),
         BotCommand(command="menu", description="Открыть меню"),
+        BotCommand(command="chatid", description="Показать ID группы"),
     ])
 
     await dp.start_polling(bot)
