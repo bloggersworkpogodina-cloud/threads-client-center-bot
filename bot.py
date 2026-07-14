@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import secrets
+import json
+import re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,8 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 import db
 
@@ -131,6 +135,10 @@ class ManagerFlow(StatesGroup):
     waiting_message = State()
 
 
+class SheetFlow(StatesGroup):
+    waiting_url = State()
+
+
 class AnalyticsFlow(StatesGroup):
     client = State()
     analytics_date = State()
@@ -151,6 +159,75 @@ class ResultFlow(StatesGroup):
 
 async def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+
+def extract_sheet_id(url: str):
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    return match.group(1) if match else None
+
+
+def google_sheets_service():
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        raise RuntimeError("Не задан GOOGLE_SERVICE_ACCOUNT_JSON")
+    info = json.loads(raw)
+    credentials = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+
+def normalize_date(value: str) -> str:
+    value = (value or "").strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return value
+
+
+def read_today_posts_from_sheet(sheet_url: str):
+    sheet_id = extract_sheet_id(sheet_url)
+    if not sheet_id:
+        raise ValueError("Не удалось определить ID Google Таблицы")
+
+    service = google_sheets_service()
+    metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    first_sheet = metadata["sheets"][0]["properties"]["title"]
+
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"'{first_sheet}'!A:D")
+        .execute()
+    )
+    rows = result.get("values", [])
+    if not rows:
+        return []
+
+    header = [str(x).strip().lower() for x in rows[0]]
+    expected = {"дата", "время", "ветка", "статус"}
+    if not expected.issubset(set(header)):
+        raise ValueError("В таблице нужны колонки: Дата, Время, Ветка, Статус")
+
+    indexes = {name: header.index(name) for name in expected}
+    today = date.today().isoformat()
+    posts = []
+
+    for row in rows[1:]:
+        def cell(name):
+            idx = indexes[name]
+            return str(row[idx]).strip() if idx < len(row) else ""
+
+        if normalize_date(cell("дата")) == today and cell("статус").lower() == "готово":
+            text = cell("ветка")
+            if text:
+                posts.append((cell("время"), text))
+
+    posts.sort(key=lambda item: item[0])
+    return posts
 
 
 
@@ -278,11 +355,37 @@ async def client_card(callback: CallbackQuery):
         f"Статус: {status}"
     )
     topic_text = "💬 Тема уже создана" if c["topic_id"] else "💬 Создать тему"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=topic_text, callback_data=f"client_topic:{client_id}")
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=topic_text, callback_data=f"client_topic:{client_id}")],
+        [InlineKeyboardButton(text="📊 Подключить таблицу", callback_data=f"sheet_connect:{client_id}")],
+    ])
     await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sheet_connect:"))
+async def sheet_connect_start(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    client_id = int(callback.data.split(":")[1])
+    await state.update_data(sheet_client_id=client_id)
+    await state.set_state(SheetFlow.waiting_url)
+    await callback.message.answer("Пришлите ссылку на Google Таблицу клиента:")
+    await callback.answer()
+
+
+@router.message(SheetFlow.waiting_url)
+async def sheet_connect_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    url = (message.text or "").strip()
+    if not extract_sheet_id(url):
+        await message.answer("Не похоже на ссылку Google Таблицы. Пришлите полную ссылку.")
+        return
+    data = await state.get_data()
+    await db.set_sheet_url(data["sheet_client_id"], url)
+    await state.clear()
+    await message.answer("Google Таблица подключена ✅", reply_markup=admin_menu())
 
 
 @router.callback_query(F.data == "client_add")
@@ -549,13 +652,32 @@ async def published(callback: CallbackQuery, bot: Bot):
 
 
 @router.message(F.text == "📅 Ветки на сегодня")
-async def client_today_posts(message: Message, bot: Bot):
+async def client_today_posts(message: Message):
     client = await db.get_client_by_tg(message.from_user.id)
     if not client:
+        await message.answer("Личный кабинет не найден.")
         return
-    ok, text = await send_posts_to_client(bot, client["id"], date.today().isoformat())
-    if not ok:
-        await message.answer(text)
+
+    sheet_url = client["sheet_url"]
+    if not sheet_url:
+        await message.answer("Таблица с ветками пока не подключена.")
+        return
+
+    try:
+        posts = read_today_posts_from_sheet(sheet_url)
+    except Exception as exc:
+        logging.exception("Не удалось прочитать Google Таблицу: %s", exc)
+        await message.answer("Не удалось загрузить ветки из таблицы. Сообщите менеджеру.")
+        return
+
+    if not posts:
+        await message.answer("На сегодня готовых веток в таблице нет.")
+        return
+
+    await message.answer("<b>📅 Ветки на сегодня</b>")
+    for time_value, text in posts:
+        prefix = f"<b>{time_value}</b>\n\n" if time_value else ""
+        await message.answer(prefix + text)
 
 
 @router.message(F.text == "📄 Контент-план")

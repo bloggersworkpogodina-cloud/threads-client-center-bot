@@ -76,6 +76,8 @@ async def init_db():
         columns = {row[1] for row in await cur.fetchall()}
         if "content_plan_url" not in columns:
             await db.execute("ALTER TABLE clients ADD COLUMN content_plan_url TEXT")
+        if "sheet_url" not in columns:
+            await db.execute("ALTER TABLE clients ADD COLUMN sheet_url TEXT")
 
         # Исправляем только группы дублей по Threads username.
         cur = await db.execute(
@@ -384,6 +386,16 @@ async def set_content_plan_url(client_id, url):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE clients SET content_plan_url = ? WHERE id = ?",
+            (url, client_id),
+        )
+        await db.commit()
+
+
+
+async def set_sheet_url(client_id, url):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE clients SET sheet_url = ? WHERE id = ?",
             (url, client_id),
         )
         await db.commit()
