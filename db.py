@@ -71,20 +71,19 @@ async def init_db():
             );
             """
         )
-        # Миграция существующей базы: добавляем ссылку на контент-план без удаления данных.
+        # Миграция существующей базы без удаления данных.
         cur = await db.execute("PRAGMA table_info(clients)")
         columns = {row[1] for row in await cur.fetchall()}
         if "content_plan_url" not in columns:
             await db.execute("ALTER TABLE clients ADD COLUMN content_plan_url TEXT")
 
-        # Чистим старые дубли без удаления истории.
+        # Исправляем только группы дублей по Threads username.
         cur = await db.execute(
             """
             SELECT LOWER(TRIM(threads_username)) AS key_name
             FROM clients
             WHERE threads_username IS NOT NULL
               AND TRIM(threads_username) != ''
-              AND is_active = 1
             GROUP BY LOWER(TRIM(threads_username))
             HAVING COUNT(*) > 1
             """
@@ -97,9 +96,9 @@ async def init_db():
                 SELECT id, telegram_id, topic_id, content_plan_url
                 FROM clients
                 WHERE LOWER(TRIM(threads_username)) = ?
-                  AND is_active = 1
                 ORDER BY
                     CASE WHEN telegram_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+                    CASE WHEN topic_id IS NOT NULL THEN 1 ELSE 0 END DESC,
                     id DESC
                 """,
                 (key_name,),
@@ -107,38 +106,35 @@ async def init_db():
             rows = await cur.fetchall()
             keeper = rows[0]
             keeper_id = keeper[0]
-            keeper_telegram_id = keeper[1]
             keeper_topic_id = keeper[2]
             keeper_content_plan = keeper[3]
 
+            await db.execute(
+                """
+                UPDATE clients
+                SET is_active = 0
+                WHERE LOWER(TRIM(threads_username)) = ?
+                """,
+                (key_name,),
+            )
+
             for row in rows[1:]:
-                duplicate_id, telegram_id, topic_id, content_plan_url = row
-
-                if keeper_telegram_id is None and telegram_id is not None:
-                    await db.execute(
-                        "UPDATE clients SET telegram_id = ? WHERE id = ?",
-                        (telegram_id, keeper_id),
-                    )
-                    keeper_telegram_id = telegram_id
-
+                _, _, topic_id, content_plan_url = row
                 if keeper_topic_id is None and topic_id is not None:
-                    await db.execute(
-                        "UPDATE clients SET topic_id = ? WHERE id = ?",
-                        (topic_id, keeper_id),
-                    )
                     keeper_topic_id = topic_id
-
                 if not keeper_content_plan and content_plan_url:
-                    await db.execute(
-                        "UPDATE clients SET content_plan_url = ? WHERE id = ?",
-                        (content_plan_url, keeper_id),
-                    )
                     keeper_content_plan = content_plan_url
 
-                await db.execute(
-                    "UPDATE clients SET is_active = 0 WHERE id = ?",
-                    (duplicate_id,),
-                )
+            await db.execute(
+                """
+                UPDATE clients
+                SET is_active = 1,
+                    topic_id = COALESCE(?, topic_id),
+                    content_plan_url = COALESCE(?, content_plan_url)
+                WHERE id = ?
+                """,
+                (keeper_topic_id, keeper_content_plan, keeper_id),
+            )
 
         await db.execute(
             """
@@ -160,7 +156,7 @@ async def add_client(name, invite_code, threads_username=None, telegram_link=Non
             INSERT INTO clients(name, invite_code, threads_username, telegram_link)
             VALUES (?, ?, ?, ?)
             """,
-            (name, invite_code, threads_username.strip().lstrip("@") if threads_username else None, telegram_link),
+            (name, invite_code, threads_username, telegram_link),
         )
         await db.commit()
         return cur.lastrowid
