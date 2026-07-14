@@ -351,6 +351,47 @@ async def create_existing_client_topic(callback: CallbackQuery, bot: Bot):
         await callback.answer("Ошибка создания темы. Проверьте права бота.", show_alert=True)
 
 
+@router.message(F.text == "💬 Создать темы")
+async def create_missing_topics(message: Message, bot: Bot):
+    if not await is_admin(message.from_user.id):
+        return
+    if not WORK_GROUP_ID:
+        await message.answer("Не указан WORK_GROUP_ID.")
+        return
+
+    clients = await db.list_clients()
+    created = []
+    already = []
+    failed = []
+
+    for client in clients:
+        try:
+            current = await db.get_client(client["id"])
+            if current["topic_id"]:
+                already.append(current["name"])
+                continue
+            topic_id = await ensure_client_topic(bot, current["id"])
+            if topic_id:
+                created.append(current["name"])
+            else:
+                failed.append(current["name"])
+        except Exception:
+            logging.exception("Failed to create topic for client %s", client["id"])
+            failed.append(client["name"])
+
+    parts = []
+    if created:
+        parts.append("Созданы темы: " + ", ".join(created))
+    if already:
+        parts.append("Уже были созданы: " + ", ".join(already))
+    if failed:
+        parts.append("Не удалось создать: " + ", ".join(failed))
+    if not parts:
+        parts.append("Клиентов пока нет.")
+
+    await message.answer("\n".join(parts))
+
+
 @router.message(F.text == "📝 Ветки")
 async def posts_menu(message: Message):
     if not await is_admin(message.from_user.id):
