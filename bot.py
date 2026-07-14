@@ -208,17 +208,20 @@ async def clients(message: Message):
     if not await is_admin(message.from_user.id):
         return
     rows = await db.list_clients()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить клиента", callback_data="client_add")],
-            *[
-                [InlineKeyboardButton(text=c["name"], callback_data=f"client_view:{c['id']}")]
-                for c in rows
-            ],
-        ]
+    buttons = [
+        [InlineKeyboardButton(text="➕ Добавить клиента", callback_data="client_add")]
+    ]
+    for c in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                text=c["name"],
+                callback_data=f"client_card:{c['id']}"
+            )
+        ])
+    await message.answer(
+        "Клиенты:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
-    await message.answer("Клиенты:", reply_markup=kb)
-
 
 
 @router.callback_query(F.data.startswith("client_open:"))
@@ -241,6 +244,30 @@ async def open_client_card_fixed(callback: CallbackQuery):
     ]])
     await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
+
+@router.callback_query(F.data.startswith("client_card:"))
+async def client_card(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    client_id = int(callback.data.split(":")[1])
+    c = await db.get_client(client_id)
+    if not c:
+        await callback.answer("Клиент не найден", show_alert=True)
+        return
+    status = "подключён" if c["telegram_id"] else "не подключён"
+    text = (
+        f"<b>{c['name']}</b>\n"
+        f"Threads: @{c['threads_username'] or '—'}\n"
+        f"Telegram: {c['telegram_link'] or '—'}\n"
+        f"Статус: {status}"
+    )
+    topic_text = "💬 Тема уже создана" if c["topic_id"] else "💬 Создать тему"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=topic_text, callback_data=f"client_topic:{client_id}")
+    ]])
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
 
 @router.callback_query(F.data == "client_add")
 async def client_add(callback: CallbackQuery, state: FSMContext):
@@ -298,6 +325,30 @@ async def client_view(callback: CallbackQuery):
     )
     await callback.message.answer(text)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("client_topic:"))
+async def create_existing_client_topic(callback: CallbackQuery, bot: Bot):
+    if not await is_admin(callback.from_user.id):
+        return
+    client_id = int(callback.data.split(":")[1])
+    client = await db.get_client(client_id)
+    if not client:
+        await callback.answer("Клиент не найден", show_alert=True)
+        return
+    if client["topic_id"]:
+        await callback.answer("Тема уже создана ✅", show_alert=True)
+        return
+    if not WORK_GROUP_ID:
+        await callback.answer("Не указан WORK_GROUP_ID", show_alert=True)
+        return
+    try:
+        await ensure_client_topic(bot, client_id)
+        await callback.message.answer(f"Тема для клиента <b>{client['name']}</b> создана ✅")
+        await callback.answer("Готово ✅")
+    except Exception:
+        logging.exception("Topic creation error")
+        await callback.answer("Ошибка создания темы. Проверьте права бота.", show_alert=True)
 
 
 @router.message(F.text == "📝 Ветки")
